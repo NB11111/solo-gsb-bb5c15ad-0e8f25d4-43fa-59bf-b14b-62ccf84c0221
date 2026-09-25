@@ -4,7 +4,8 @@
 解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对；
 直播进行中还可对节目单做延误分摊，在不移动固定开场时刻的前提下把延误按各段
 可压缩余量比例分配给未播段；直播结束后可将计划口令与实播记录按通道保序对账，
-以最小的起止偏差与漏播、额外播出罚分还原实际播出情况。
+以最小的起止偏差与漏播、额外播出罚分还原实际播出情况；也可以在不改变任何
+起止时刻的前提下做通道改派，用最少的改派消除同通道时间重叠冲突。
 
 - 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
@@ -12,6 +13,7 @@
 - 改动预览接口：`POST /preview`
 - 节目单延误分摊接口：`POST /schedule/rebalance`
 - 实播对账接口：`POST /runs/reconcile`
+- 通道改派接口：`POST /routing/assign`
 
 ## 一条命令启动
 
@@ -538,6 +540,130 @@ curl -s http://localhost:8000/runs/reconcile \
 }
 ```
 
+## 接口约定：`POST /routing/assign`
+
+在不改变任何口令起止时刻的前提下做**通道改派**：为每条口令从「原通道 + 备用通道」
+中选择一个通道，使时间重叠的口令不同通道，并全局最小化被改派的口令条数。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `alternatives` | array | 是 | 按 id 指定的备用通道列表（可为空数组），最多 12 条，见下表 |
+
+`alternatives` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 要指定备用通道的口令 id（必须存在于 `commands` 中，且不可重复出现） |
+| `channels` | array | 是 | 备用通道列表（可为空数组）；通道名不能为空，列表内不可重复 |
+
+改派规则：
+
+- 服务端先按与 `/compile` 完全相同的方式解析并校验口令时间（重复 id、缺失锚点、
+  依赖环、负起点等错误码全部沿用）；**改派只改变通道，任何口令的
+  `start_ms` / `end_ms` 都与 `/compile` 的解析结果一致**。
+- 未在 `alternatives` 中列出的口令只能留在原通道；列出的口令候选通道为
+  「原通道 + 备用通道」——**原通道始终可选**，无需也不应写进 `channels`
+  （写入了会被静默去重，不算重复备用通道）。
+- **时间重叠（半开区间相交）的口令不得分到同一通道**；首尾相接（前一个
+  `end_ms` 等于后一个 `start_ms`）可以共用通道。
+- 在所有无冲突方案中，全局选择 **改派口令数最少** 的方案；仍有并列时，把全部分配
+  按口令 id 排序后得到的通道名序列做字典序比较，取最小者。
+- 不存在无冲突方案（例如两两重叠的口令多于可用通道数）时，返回 `422` +
+  `NO_FEASIBLE_ASSIGNMENT`。
+
+响应字段：
+
+- `timeline`：改派后的时间线，格式与 `/compile` 一致，按 `(start_ms, id)` 升序，
+  `channel` 为改派后的通道。
+- `changed_ids`：通道被改派的口令 id，按 id 升序。
+
+### 请求示例
+
+`a` 为 `[0, 1000)`，`b` 锚定 `a` 结束时刻 −500 → `[500, 1500)`，二者在 `main`
+上重叠；`c` 在 `sub` 上为 `[0, 800)`。`b` 的备用通道为 `sub` 与 `backup`：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,    "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": -500, "duration_ms": 1000},
+      {"id": "c", "channel": "sub",  "anchor": "START", "offset_ms": 0,    "duration_ms": 800}
+    ],
+    "alternatives": [
+      {"id": "b", "channels": ["sub", "backup"]}
+    ]
+  }'
+```
+
+`b` 若改去 `sub` 会与 `c`（`[0, 800)`）重叠，因此最小改派方案是把 `b` 改到
+`backup`（仅 1 条改派）。响应示例（`200`）：
+
+```json
+{
+  "timeline": [
+    {
+      "id": "a",
+      "channel": "main",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 1000,
+      "start_ms": 0,
+      "end_ms": 1000
+    },
+    {
+      "id": "c",
+      "channel": "sub",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 800,
+      "start_ms": 0,
+      "end_ms": 800
+    },
+    {
+      "id": "b",
+      "channel": "backup",
+      "anchor": "a",
+      "offset_ms": -500,
+      "duration_ms": 1000,
+      "start_ms": 500,
+      "end_ms": 1500
+    }
+  ],
+  "changed_ids": ["b"]
+}
+```
+
+### 请求示例（无可行方案，422）
+
+三条口令两两重叠，而可用通道只有 `main` / `sub` 两个，必有一对同通道：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "offset_ms": 0,  "duration_ms": 100},
+      {"id": "b", "channel": "main", "offset_ms": 10, "duration_ms": 100},
+      {"id": "c", "channel": "main", "offset_ms": 20, "duration_ms": 100}
+    ],
+    "alternatives": [
+      {"id": "a", "channels": ["sub"]}
+    ]
+  }'
+```
+
+```json
+{
+  "code": "NO_FEASIBLE_ASSIGNMENT",
+  "message": "不存在无冲突的改派方案：可用通道不足以隔开所有时间重叠的口令"
+}
+```
+
 ## 错误处理
 
 所有业务错误均返回 HTTP `422`，响应体统一为：
@@ -567,6 +693,10 @@ curl -s http://localhost:8000/runs/reconcile \
 | `INVALID_ACTUAL_END` | 仅 `POST /schedule/rebalance`：实际结束时刻为负、已结束段不构成连续前缀、结束时刻非单调不减，或已结束固定点段结束时刻早于其固定开场时刻 |
 | `INSUFFICIENT_MARGIN` | 仅 `POST /schedule/rebalance`：固定点前可压缩余量不足，`details.unrecoverable_sec` 为无法追回的秒数 |
 | `INVALID_INTERVAL` | 仅 `POST /runs/reconcile`：实播记录起点为负，或结束时刻不大于起点 |
+| `UNKNOWN_COMMAND_ID` | 仅 `POST /routing/assign`：`alternatives` 指向不存在的口令 id |
+| `DUPLICATE_CHANNEL` | 仅 `POST /routing/assign`：同一口令的备用通道列表内出现重复通道 |
+| `TOO_MANY_ALTERNATIVES` | 仅 `POST /routing/assign`：携带备用通道的口令超过 12 条 |
+| `NO_FEASIBLE_ASSIGNMENT` | 仅 `POST /routing/assign`：不存在无冲突的改派方案 |
 
 `POST /schedule/rebalance` 额外约定：
 
@@ -593,6 +723,16 @@ curl -s http://localhost:8000/runs/reconcile \
   返回 `INVALID_INTERVAL`。
 - 计划口令与实播记录同时非法时，先返回计划侧（`commands`）的错误码。
 
+`POST /routing/assign` 额外约定：
+
+- `commands` 的全部校验与错误码和 `/compile` 完全一致（含重复 id、缺失锚点、
+  依赖环、负起点等），且先于 `alternatives` 的校验返回。
+- `alternatives` 中同一 `id` 重复出现返回 `DUPLICATE_ID`；指向未知口令返回
+  `UNKNOWN_COMMAND_ID`；备用通道名为空字符串返回 `INVALID_CHANNEL`；同一口令的
+  备用通道列表内通道重复返回 `DUPLICATE_CHANNEL`；条目超过 12 条返回
+  `TOO_MANY_ALTERNATIVES`（`details.count` / `details.max` 分别为实际与上限）。
+- 字段缺失、类型错误或出现多余字段时，返回 `INVALID_REQUEST`。
+
 ## 本地开发（不使用 Docker）
 
 要求 Python 3.11+：
@@ -603,7 +743,8 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 核心编排逻辑位于 `app/compiler.py`，节目单延误分摊逻辑位于 `app/rebalance.py`，
-实播对账逻辑位于 `app/reconcile.py`，均仅使用标准库，可直接运行单元测试：
+实播对账逻辑位于 `app/reconcile.py`，通道改派逻辑位于 `app/routing.py`，
+均仅使用标准库，可直接运行单元测试：
 
 ```bash
 python3 -m unittest discover -s tests
@@ -618,12 +759,14 @@ python3 -m unittest discover -s tests
 │   ├── compiler.py        # 纯标准库的依赖解析 / 时间计算 / 冲突检测
 │   ├── rebalance.py       # 纯标准库的节目单延误分摊（固定点切窗 + 余量比例分摊）
 │   ├── reconcile.py       # 纯标准库的实播对账（通道内保序一对一匹配 + 最小罚分 DP）
+│   ├── routing.py         # 纯标准库的通道改派（重叠图连通分量 + 迭代加深最小改派搜索）
 │   ├── schemas.py         # Pydantic 请求与响应模型
-│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/health、统一错误处理）
+│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/routing/assign、/health、统一错误处理）
 ├── tests/
 │   ├── test_compiler.py   # 编排核心逻辑单元测试（标准库 unittest）
 │   ├── test_rebalance.py  # 延误分摊核心逻辑单元测试（标准库 unittest）
-│   └── test_reconcile.py  # 实播对账核心逻辑单元测试（标准库 unittest）
+│   ├── test_reconcile.py  # 实播对账核心逻辑单元测试（标准库 unittest）
+│   └── test_routing.py    # 通道改派核心逻辑单元测试（标准库 unittest）
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml

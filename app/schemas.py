@@ -242,6 +242,45 @@ class ReconcileResponse(BaseModel):
     total_penalty: int = Field(..., description="总罚分（匹配偏差绝对值之和 + 未匹配罚分）")
 
 
+class ChannelAlternatives(BaseModel):
+    """一条口令的备用通道列表：改派时除原通道外还可选用的通道。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="要指定备用通道的口令 id（须存在于 commands 中）")
+    channels: list[str] = Field(
+        ...,
+        description="备用通道列表；原通道始终可选，无需也不应重复填写，列表内不可重复",
+    )
+
+
+class AssignRequest(BaseModel):
+    """POST /routing/assign 请求体：/compile 同格式口令数组 + 按 id 指定的备用通道列表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    commands: list[CommandItem] = Field(
+        ..., description="口令数组，格式与 POST /compile 的请求体一致"
+    )
+    alternatives: list[ChannelAlternatives] = Field(
+        ...,
+        description="按 id 指定的备用通道列表；最多 12 条，未列出的口令只能留在原通道",
+    )
+
+
+class AssignResponse(BaseModel):
+    timeline: list[TimelineEntry] = Field(
+        ...,
+        description=(
+            "改派后的时间线，按 (start_ms, id) 升序；"
+            "所有口令的起止时刻与 /compile 的解析结果完全一致，仅通道可能被改派"
+        ),
+    )
+    changed_ids: list[str] = Field(
+        ..., description="通道被改派的口令 id，按 id 升序"
+    )
+
+
 class ErrorBody(BaseModel):
     code: Literal[
         "INVALID_REQUEST",
@@ -257,6 +296,10 @@ class ErrorBody(BaseModel):
         "INVALID_ACTUAL_END",
         "INSUFFICIENT_MARGIN",
         "INVALID_INTERVAL",
+        "UNKNOWN_COMMAND_ID",
+        "DUPLICATE_CHANNEL",
+        "TOO_MANY_ALTERNATIVES",
+        "NO_FEASIBLE_ASSIGNMENT",
     ]
     message: str
     details: dict | None = None

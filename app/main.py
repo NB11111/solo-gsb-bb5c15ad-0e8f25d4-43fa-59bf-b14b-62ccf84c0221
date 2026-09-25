@@ -10,7 +10,10 @@ from fastapi.responses import JSONResponse
 from .compiler import CompileError, compile_commands, preview_change
 from .rebalance import rebalance_schedule
 from .reconcile import reconcile_runs
+from .routing import assign_channels
 from .schemas import (
+    AssignRequest,
+    AssignResponse,
     CommandItem,
     CompileResponse,
     ErrorBody,
@@ -24,14 +27,16 @@ from .schemas import (
 
 app = FastAPI(
     title="直播导播口令编排 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "接收导播口令数组，解析锚点依赖得到每条口令的起止毫秒时间，"
         "并列出同通道半开区间重叠的冲突 id 对；"
         "支持预览单条口令改动带来的时间传导与冲突对增减；"
         "并按可压缩余量比例分摊节目单延误，保证固定开场时刻不被移动；"
         "直播结束后还可将计划口令与实播记录按通道保序对账，"
-        "最小化起止偏差与漏播、额外播出罚分之和。"
+        "最小化起止偏差与漏播、额外播出罚分之和；"
+        "亦可在不改变任何起止时刻的前提下做通道改派，"
+        "用最少的改派消除同通道时间重叠冲突。"
     ),
 )
 
@@ -116,4 +121,19 @@ async def reconcile(body: ReconcileRequest) -> dict:
         tolerance_ms=body.tolerance_ms,
         miss_penalty=body.miss_penalty,
         extra_penalty=body.extra_penalty,
+    )
+
+
+@app.post(
+    "/routing/assign",
+    response_model=AssignResponse,
+    tags=["routing"],
+    summary="通道改派：不改变起止时刻，用最少的改派消除同通道时间重叠冲突",
+    responses={422: {"model": ErrorBody, "description": "请求非法或无可行改派方案"}},
+)
+async def assign(body: AssignRequest) -> dict:
+    # 核心逻辑不依赖 Pydantic，直接喂入 dict 以便独立测试与复用
+    return assign_channels(
+        [item.model_dump() for item in body.commands],
+        [alt.model_dump() for alt in body.alternatives],
     )
