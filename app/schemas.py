@@ -114,6 +114,52 @@ class PreviewResponse(BaseModel):
     )
 
 
+class BackupChannelSpec(BaseModel):
+    """一条口令的备用通道声明：按 id 指定允许改派到的通道列表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="口令 id（必须存在于 commands 中，不能为空）")
+    backup_channels: list[str] = Field(
+        ...,
+        description=(
+            "备用通道名列表；不能为空字符串、同一条声明内不能重复，"
+            "原通道始终可选且无需列入"
+        ),
+        min_length=1,
+    )
+
+
+class RoutingAssignRequest(BaseModel):
+    """POST /routing/assign 请求体：/compile 同格式口令数组 + 按 id 的备用通道声明。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    commands: list[CommandItem] = Field(
+        ..., description="口令数组，格式与 POST /compile 的请求体一致"
+    )
+    backups: list[BackupChannelSpec] = Field(
+        ...,
+        description=(
+            "按口令 id 声明的备用通道列表；未列出的口令只能留在原通道，"
+            "最多 12 条口令可拥有备用通道"
+        ),
+        max_length=12,
+    )
+
+
+class RoutingAssignResponse(BaseModel):
+    timeline: list[TimelineEntry] = Field(
+        ...,
+        description=(
+            "改派后的时间线，仅 channel 可能变化；起止时刻、排序均与 /compile 一致"
+        ),
+    )
+    changed_ids: list[str] = Field(
+        ..., description="实际改派通道的口令 id（新通道与原通道不同），按 id 升序"
+    )
+
+
 class RebalanceSegment(BaseModel):
     """单条节目段。
 
@@ -257,6 +303,10 @@ class ErrorBody(BaseModel):
         "INVALID_ACTUAL_END",
         "INSUFFICIENT_MARGIN",
         "INVALID_INTERVAL",
+        "ROUTING_TARGET_NOT_FOUND",
+        "DUPLICATE_BACKUP_CHANNEL",
+        "TOO_MANY_BACKUP_TARGETS",
+        "NO_FEASIBLE_ROUTING",
     ]
     message: str
     details: dict | None = None

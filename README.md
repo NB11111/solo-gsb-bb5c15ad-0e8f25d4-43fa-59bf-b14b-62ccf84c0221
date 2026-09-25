@@ -4,7 +4,9 @@
 解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对；
 直播进行中还可对节目单做延误分摊，在不移动固定开场时刻的前提下把延误按各段
 可压缩余量比例分配给未播段；直播结束后可将计划口令与实播记录按通道保序对账，
-以最小的起止偏差与漏播、额外播出罚分还原实际播出情况。
+以最小的起止偏差与漏播、额外播出罚分还原实际播出情况；还可在不改变任何起止
+时刻的前提下，把口令全局改派到按 id 指定的备用通道，求改派口令最少、并列时
+通道名序列字典序最小的无冲突方案。
 
 - 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
@@ -12,6 +14,7 @@
 - 改动预览接口：`POST /preview`
 - 节目单延误分摊接口：`POST /schedule/rebalance`
 - 实播对账接口：`POST /runs/reconcile`
+- 通道改派接口：`POST /routing/assign`
 
 ## 一条命令启动
 
@@ -538,6 +541,158 @@ curl -s http://localhost:8000/runs/reconcile \
 }
 ```
 
+## 接口约定：`POST /routing/assign`
+
+在**不改变任何口令起止时刻**的前提下，把口令全局改派到按 id 指定的备用通道，
+消除同通道的时间重叠冲突。请求复用 `POST /compile` 的口令数组（先用同一套
+编排器解析锚点、校验时间），另附按口令 id 声明的备用通道列表。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `backups` | array | 是 | 按口令 id 声明的备用通道列表，**至多 12 项** |
+
+`backups` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 口令 id，必须存在于 `commands` 中且不能为空；同一 id 只能声明一次 |
+| `backup_channels` | array&lt;string&gt; | 是 | 备用通道名列表，至少 1 个；不能为空字符串、不能重复，也不应再列入原通道 |
+
+改派规则：
+
+- **只换通道、不动时间**：改派后每条口令的 `start_ms` / `end_ms`、`anchor`、
+  `offset_ms`、`duration_ms` 均保持 `/compile` 的解析结果不变，只有 `channel`
+  可能变化；`timeline` 的排序仍按 `(start_ms, id)`。
+- **未列出的口令只能留在原通道**；已列出的口令可落到**原通道或任一备用通道**
+  （原通道始终可选，无需也不应写进 `backup_channels`）。最多 **12** 条口令
+  可以拥有备用通道。
+- **半开区间重叠的口令不得分到同一通道**：`[start_ms, end_ms)` 与
+  `[start_ms', end_ms')` 重叠（`start < end'` 且 `start' < end`）即冲突；
+  **首尾相接（前一个 end 等于后一个 start）可以共用同一通道**；不同通道互不影响。
+- **全局最优**：在所有无冲突方案中，先取**改派口令数最少**（通道与原通道不同
+  的口令数）的方案；改派数并列时，取「口令按 **id 升序**排列后对应通道名序列」
+  **字典序最小**的方案。
+- 响应 `changed_ids` 为实际改派通道的口令 id（新通道与原通道不同），按 id 升序。
+- 不存在任何无冲突方案时返回 `422` + `NO_FEASIBLE_ROUTING`，`details.reason`
+  区分原因：`FIXED_OVERLAP`（不可改派口令自身重叠）、`NO_AVAILABLE_CHANNEL`
+  （某口令的原通道与全部备用通道都被占用）、`INSUFFICIENT_CHANNEL_CAPACITY`
+  （可移动口令之间无法安排）。
+
+### 请求示例（最少改派 + 字典序裁决）
+
+`a`、`b` 在 `main` 通道时间重叠，二者都有备用通道 `alt`：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,   "duration_ms": 100},
+      {"id": "b", "channel": "main", "anchor": "START", "offset_ms": 50,  "duration_ms": 100}
+    ],
+    "backups": [
+      {"id": "a", "backup_channels": ["alt"]},
+      {"id": "b", "backup_channels": ["alt"]}
+    ]
+  }'
+```
+
+最少只需改派 1 条。两个 1-move 方案按 id 排序的通道名序列分别为
+`[alt, main]`（a 改派）与 `[main, alt]`（b 改派），通道名直接按字典序比较，
+`[alt, main]` 更小，故改派 `a`。响应示例（`200`）：
+
+```json
+{
+  "timeline": [
+    {
+      "id": "a",
+      "channel": "alt",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 100,
+      "start_ms": 0,
+      "end_ms": 100
+    },
+    {
+      "id": "b",
+      "channel": "main",
+      "anchor": "START",
+      "offset_ms": 50,
+      "duration_ms": 100,
+      "start_ms": 50,
+      "end_ms": 150
+    }
+  ],
+  "changed_ids": ["a"]
+}
+```
+
+### 请求示例（未列出的口令不能动）
+
+`f` 固定在 `main` 且与 `a` 时间重叠，`a` 的原通道与备用通道 `blocked` 都被
+占用，只有 `free` 空闲：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "f", "channel": "main",    "anchor": "START", "offset_ms": 0,  "duration_ms": 100},
+      {"id": "g", "channel": "blocked", "anchor": "START", "offset_ms": 0,  "duration_ms": 100},
+      {"id": "a", "channel": "main",    "anchor": "START", "offset_ms": 50, "duration_ms": 100}
+    ],
+    "backups": [
+      {"id": "a", "backup_channels": ["blocked", "free"]}
+    ]
+  }'
+```
+
+```json
+{
+  "timeline": [
+    {"id": "f", "channel": "main",    "anchor": "START", "offset_ms": 0,  "duration_ms": 100, "start_ms": 0,   "end_ms": 100},
+    {"id": "a", "channel": "free",    "anchor": "START", "offset_ms": 50, "duration_ms": 100, "start_ms": 50,  "end_ms": 150},
+    {"id": "g", "channel": "blocked", "anchor": "START", "offset_ms": 0,  "duration_ms": 100, "start_ms": 0,   "end_ms": 100}
+  ],
+  "changed_ids": ["a"]
+}
+```
+
+### 请求示例（无可行方案，422）
+
+三条口令两两重叠，原通道均为 `main`，备用通道只有共享的 `alt`
+（2 个通道放不下 3 条两两重叠的口令）：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,  "duration_ms": 100},
+      {"id": "b", "channel": "main", "anchor": "START", "offset_ms": 10, "duration_ms": 100},
+      {"id": "c", "channel": "main", "anchor": "START", "offset_ms": 20, "duration_ms": 100}
+    ],
+    "backups": [
+      {"id": "a", "backup_channels": ["alt"]},
+      {"id": "b", "backup_channels": ["alt"]},
+      {"id": "c", "backup_channels": ["alt"]}
+    ]
+  }'
+```
+
+```json
+{
+  "code": "NO_FEASIBLE_ROUTING",
+  "message": "不存在满足时间重叠约束的无冲突改派方案",
+  "details": {
+    "reason": "INSUFFICIENT_CHANNEL_CAPACITY"
+  }
+}
+```
+
 ## 错误处理
 
 所有业务错误均返回 HTTP `422`，响应体统一为：
@@ -567,6 +722,10 @@ curl -s http://localhost:8000/runs/reconcile \
 | `INVALID_ACTUAL_END` | 仅 `POST /schedule/rebalance`：实际结束时刻为负、已结束段不构成连续前缀、结束时刻非单调不减，或已结束固定点段结束时刻早于其固定开场时刻 |
 | `INSUFFICIENT_MARGIN` | 仅 `POST /schedule/rebalance`：固定点前可压缩余量不足，`details.unrecoverable_sec` 为无法追回的秒数 |
 | `INVALID_INTERVAL` | 仅 `POST /runs/reconcile`：实播记录起点为负，或结束时刻不大于起点 |
+| `ROUTING_TARGET_NOT_FOUND` | 仅 `POST /routing/assign`：`backups[].id` 引用了不存在于 `commands` 的口令 id |
+| `DUPLICATE_BACKUP_CHANNEL` | 仅 `POST /routing/assign`：某条口令的备用通道列表存在重复通道名（含把原通道又列入） |
+| `TOO_MANY_BACKUP_TARGETS` | 仅直接调用核心逻辑时：携带备用通道的口令超过 12 条（HTTP 层由请求结构校验提前返回 `INVALID_REQUEST`） |
+| `NO_FEASIBLE_ROUTING` | 仅 `POST /routing/assign`：不存在满足时间重叠约束的无冲突方案，`details.reason` 为 `FIXED_OVERLAP` / `NO_AVAILABLE_CHANNEL` / `INSUFFICIENT_CHANNEL_CAPACITY` |
 
 `POST /schedule/rebalance` 额外约定：
 
@@ -593,6 +752,22 @@ curl -s http://localhost:8000/runs/reconcile \
   返回 `INVALID_INTERVAL`。
 - 计划口令与实播记录同时非法时，先返回计划侧（`commands`）的错误码。
 
+`POST /routing/assign` 额外约定：
+
+- `commands` 的全部校验与错误码和 `/compile` 完全一致（含重复 id、缺失锚点、
+  依赖环、负起点等），且编排非法时优先返回编排错误码。
+- `backups` 中 id 为空返回 `INVALID_ID`；同一 id 重复声明返回 `DUPLICATE_ID`；
+  id 不存在于 `commands` 返回 `ROUTING_TARGET_NOT_FOUND`。
+- 备用通道名为空字符串返回 `INVALID_CHANNEL`；同一条声明内通道名重复、或把
+  原通道又列入备用列表，返回 `DUPLICATE_BACKUP_CHANNEL`。
+- `backups` 超过 12 项、`backup_channels` 为空列表、字段缺失/类型错误/多余字段，
+  返回 `INVALID_REQUEST`。
+- 无可行方案返回 `NO_FEASIBLE_ROUTING`：不可改派的口令在原通道自身时间重叠时
+  `reason=FIXED_OVERLAP`；某条口令的原通道与全部备用通道都被时间重叠口令占用时
+  `reason=NO_AVAILABLE_CHANNEL`（`details.ids` 给出对应口令）；其余情形为
+  `INSUFFICIENT_CHANNEL_CAPACITY`。
+- 服务端不会修改请求数据；改派不改变任何起止时刻，`timeline` 仅 `channel` 可能变化。
+
 ## 本地开发（不使用 Docker）
 
 要求 Python 3.11+：
@@ -603,7 +778,8 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 核心编排逻辑位于 `app/compiler.py`，节目单延误分摊逻辑位于 `app/rebalance.py`，
-实播对账逻辑位于 `app/reconcile.py`，均仅使用标准库，可直接运行单元测试：
+实播对账逻辑位于 `app/reconcile.py`，通道改派逻辑位于 `app/routing.py`，
+均仅使用标准库，可直接运行单元测试：
 
 ```bash
 python3 -m unittest discover -s tests
@@ -618,12 +794,14 @@ python3 -m unittest discover -s tests
 │   ├── compiler.py        # 纯标准库的依赖解析 / 时间计算 / 冲突检测
 │   ├── rebalance.py       # 纯标准库的节目单延误分摊（固定点切窗 + 余量比例分摊）
 │   ├── reconcile.py       # 纯标准库的实播对账（通道内保序一对一匹配 + 最小罚分 DP）
+│   ├── routing.py         # 纯标准库的通道改派（位掩码分支限界：最少改派 + 字典序裁决）
 │   ├── schemas.py         # Pydantic 请求与响应模型
-│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/health、统一错误处理）
+│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/routing/assign、/health、统一错误处理）
 ├── tests/
 │   ├── test_compiler.py   # 编排核心逻辑单元测试（标准库 unittest）
 │   ├── test_rebalance.py  # 延误分摊核心逻辑单元测试（标准库 unittest）
-│   └── test_reconcile.py  # 实播对账核心逻辑单元测试（标准库 unittest）
+│   ├── test_reconcile.py  # 实播对账核心逻辑单元测试（标准库 unittest）
+│   └── test_routing.py    # 通道改派核心逻辑单元测试（标准库 unittest）
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
